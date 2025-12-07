@@ -59,6 +59,13 @@ export default function SessionScreen({ route, navigation, user }: SessionScreen
   const [elapsedTime, setElapsedTime] = useState<string>('00:00:00');
   const [chargedEnergy, setChargedEnergy] = useState<number>(0);
   const [spentAmount, setSpentAmount] = useState<number>(0);
+  const [realTimeMeter, setRealTimeMeter] = useState<{
+    meter_value_kwh: number;
+    total_cost: number;
+    duration_minutes: number | null;
+    timestamp: string;
+  } | null>(null);
+  const [lastUpdateTime, setLastUpdateTime] = useState<string>('');
 
   useEffect(() => {
     fetchChargerStatus();
@@ -66,6 +73,31 @@ export default function SessionScreen({ route, navigation, user }: SessionScreen
     const interval = setInterval(fetchChargerStatus, 3000);
     return () => clearInterval(interval);
   }, [chargerId]);
+
+  // 每60秒获取一次实时电量数据
+  useEffect(() => {
+    // 如果不在充电状态，清除实时数据
+    if (!charger || charger.status !== 'Charging' || !charger.session.transaction_id) {
+      setRealTimeMeter(null);
+      return;
+    }
+
+    // 立即获取一次
+    fetchRealTimeMeter();
+
+    // 每60秒获取一次（60000毫秒 = 60秒）
+    const interval = setInterval(() => {
+      console.log('[SessionScreen] 定时器触发：获取实时电量数据');
+      fetchRealTimeMeter();
+    }, 60000);
+    
+    console.log('[SessionScreen] 已启动60秒定时器，用于获取实时电量数据');
+    
+    return () => {
+      console.log('[SessionScreen] 清除60秒定时器');
+      clearInterval(interval);
+    };
+  }, [charger?.status, charger?.session?.transaction_id, chargerId]);
 
   // 实时更新已充电时间和电量
   useEffect(() => {
@@ -75,6 +107,23 @@ export default function SessionScreen({ route, navigation, user }: SessionScreen
       setChargedEnergy(0);
       setSpentAmount(0);
       return;
+    }
+
+    // 如果有实时电量数据，优先使用实时数据
+    if (realTimeMeter) {
+      setChargedEnergy(realTimeMeter.meter_value_kwh);
+      setSpentAmount(realTimeMeter.total_cost);
+      
+      // 使用实时数据的时长（如果有）
+      if (realTimeMeter.duration_minutes !== null) {
+        const totalSeconds = Math.floor(realTimeMeter.duration_minutes * 60);
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const seconds = totalSeconds % 60;
+        setElapsedTime(
+          `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+        );
+      }
     }
 
     // 如果有订单，使用订单的开始时间；否则使用充电桩的last_seen作为估计开始时间
@@ -88,14 +137,29 @@ export default function SessionScreen({ route, navigation, user }: SessionScreen
 
     const updateElapsedTime = () => {
       try {
+        // 如果已有实时数据，只更新时间显示
+        if (realTimeMeter && realTimeMeter.duration_minutes !== null) {
+          const totalSeconds = Math.floor(realTimeMeter.duration_minutes * 60);
+          const hours = Math.floor(totalSeconds / 3600);
+          const minutes = Math.floor((totalSeconds % 3600) / 60);
+          const seconds = totalSeconds % 60;
+          setElapsedTime(
+            `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+          );
+          return;
+        }
+
+        // 否则使用估算方式
         const startTime = getStartTime();
         const now = new Date();
         const diffMs = now.getTime() - startTime.getTime();
         
         if (diffMs < 0) {
           setElapsedTime('00:00:00');
-          setChargedEnergy(0);
-          setSpentAmount(0);
+          if (!realTimeMeter) {
+            setChargedEnergy(0);
+            setSpentAmount(0);
+          }
           return;
         }
         
@@ -107,16 +171,19 @@ export default function SessionScreen({ route, navigation, user }: SessionScreen
         const timeStr = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
         setElapsedTime(timeStr);
         
-        // 计算已充电电量（kWh）= 充电速率（kW）× 时长（小时）
-        const hoursDecimal = diffMs / (1000 * 60 * 60);
-        const chargingRate = currentOrder?.charging_rate || charger.charging_rate || 7.0;
-        const energyKwh = chargingRate * hoursDecimal;
-        setChargedEnergy(Math.max(0, energyKwh));
-        
-        // 计算已花费金额（COP）= 电量（kWh）× 单价（从充电桩获取，默认2700 COP/kWh）
-        const pricePerKwh = charger.price_per_kwh || 2700;
-        const amount = energyKwh * pricePerKwh;
-        setSpentAmount(Math.max(0, amount));
+        // 如果没有实时数据，使用估算方式
+        if (!realTimeMeter) {
+          // 计算已充电电量（kWh）= 充电速率（kW）× 时长（小时）
+          const hoursDecimal = diffMs / (1000 * 60 * 60);
+          const chargingRate = currentOrder?.charging_rate || charger.charging_rate || 7.0;
+          const energyKwh = chargingRate * hoursDecimal;
+          setChargedEnergy(Math.max(0, energyKwh));
+          
+          // 计算已花费金额（COP）= 电量（kWh）× 单价（从充电桩获取，默认2700 COP/kWh）
+          const pricePerKwh = charger.price_per_kwh || 2700;
+          const amount = energyKwh * pricePerKwh;
+          setSpentAmount(Math.max(0, amount));
+        }
       } catch (error) {
         console.error('[SessionScreen] 计算时间失败:', error);
       }
@@ -125,10 +192,10 @@ export default function SessionScreen({ route, navigation, user }: SessionScreen
     // 立即更新一次
     updateElapsedTime();
     
-    // 每秒更新一次
+    // 每秒更新一次（仅更新时间显示）
     const interval = setInterval(updateElapsedTime, 1000);
     return () => clearInterval(interval);
-  }, [charger, currentOrder]);
+  }, [charger, currentOrder, realTimeMeter]);
 
   const fetchChargerStatus = async () => {
     try {
@@ -226,6 +293,52 @@ export default function SessionScreen({ route, navigation, user }: SessionScreen
       console.error('[SessionScreen] 获取当前订单失败:', error);
       // 即使获取失败也不清除currentOrder，保持之前的值（如果有）
       // setCurrentOrder(null);
+    }
+  };
+
+  const fetchRealTimeMeter = async () => {
+    if (!charger || !charger.session.transaction_id) {
+      console.log('[SessionScreen] 跳过获取实时电量：充电桩或事务ID不存在');
+      return;
+    }
+
+    try {
+      const url = `${API_ENDPOINTS.currentOrderMeter}?chargePointId=${encodeURIComponent(chargerId)}&transactionId=${charger.session.transaction_id}`;
+      console.log('[SessionScreen] 正在请求实时电量数据:', url);
+      
+      const res = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+      
+      if (res.ok) {
+        const meterData = await res.json();
+        console.log('[SessionScreen] 收到实时电量数据:', {
+          energy_kwh: meterData.meter_value_kwh,
+          cost_cop: meterData.total_cost,
+          duration_minutes: meterData.duration_minutes,
+          timestamp: meterData.timestamp,
+        });
+        
+        // 更新实时数据
+        const updateTime = meterData.timestamp || new Date().toISOString();
+        setRealTimeMeter({
+          meter_value_kwh: meterData.meter_value_kwh || 0,
+          total_cost: meterData.total_cost || 0,
+          duration_minutes: meterData.duration_minutes || null,
+          timestamp: updateTime,
+        });
+        setLastUpdateTime(new Date(updateTime).toLocaleTimeString());
+      } else {
+        const errorText = await res.text();
+        console.warn('[SessionScreen] 获取实时电量数据失败, 状态码:', res.status, '响应:', errorText);
+        // 不清除已有数据，保持显示最后一次成功的数据
+      }
+    } catch (error) {
+      console.error('[SessionScreen] 获取实时电量数据失败:', error);
+      // 不清除已有数据，保持显示最后一次成功的数据
     }
   };
 
@@ -403,17 +516,42 @@ export default function SessionScreen({ route, navigation, user }: SessionScreen
                 </Text>
               </View>
               <View style={styles.statusRow}>
-                <Text style={styles.statusLabel}>已充电电量</Text>
-                <Text style={[styles.statusValue, styles.highlightValue]}>
-                  {chargedEnergy.toFixed(2)} kWh
-                </Text>
+                <Text style={styles.statusLabel}>已消耗电量</Text>
+                <View style={styles.valueContainer}>
+                  <Text style={[styles.statusValue, styles.highlightValue]}>
+                    {realTimeMeter ? realTimeMeter.meter_value_kwh.toFixed(3) : chargedEnergy.toFixed(2)} kWh
+                  </Text>
+                  {realTimeMeter && (
+                    <Text style={styles.realTimeBadge}>实时</Text>
+                  )}
+                </View>
               </View>
               <View style={styles.statusRow}>
-                <Text style={styles.statusLabel}>已花费金额</Text>
-                <Text style={[styles.statusValue, styles.highlightValue]}>
-                  {spentAmount.toFixed(0)} COP
-                </Text>
+                <Text style={styles.statusLabel}>实时话费</Text>
+                <View style={styles.valueContainer}>
+                  <Text style={[styles.statusValue, styles.highlightValue]}>
+                    {realTimeMeter ? realTimeMeter.total_cost.toFixed(2) : spentAmount.toFixed(0)} COP
+                  </Text>
+                  {realTimeMeter && (
+                    <Text style={styles.realTimeBadge}>实时</Text>
+                  )}
+                </View>
               </View>
+              {realTimeMeter && (
+                <View style={styles.statusRow}>
+                  <Text style={styles.statusLabel}>数据更新时间</Text>
+                  <Text style={[styles.statusValue, { fontSize: 12, color: '#666' }]}>
+                    {lastUpdateTime || new Date(realTimeMeter.timestamp).toLocaleTimeString()}
+                  </Text>
+                </View>
+              )}
+              {charger.status === 'Charging' && (
+                <View style={styles.infoBox}>
+                  <Text style={styles.infoText}>
+                    💡 实时数据每60秒自动更新一次
+                  </Text>
+                </View>
+              )}
             </>
           )}
           {charger.connector_type && (
@@ -545,6 +683,20 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: '700',
   },
+  valueContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  realTimeBadge: {
+    fontSize: 10,
+    color: '#34c759',
+    backgroundColor: '#e8f5e9',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    fontWeight: '600',
+  },
   button: {
     backgroundColor: '#34c759',
     borderRadius: 12,
@@ -609,6 +761,19 @@ const styles = StyleSheet.create({
   hintText: {
     fontSize: 14,
     color: '#856404',
+    textAlign: 'center',
+  },
+  infoBox: {
+    backgroundColor: '#e3f2fd',
+    borderRadius: 8,
+    padding: 12,
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: '#2196f3',
+  },
+  infoText: {
+    fontSize: 12,
+    color: '#1976d2',
     textAlign: 'center',
   },
 });

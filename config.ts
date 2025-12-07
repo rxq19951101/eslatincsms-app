@@ -1,41 +1,112 @@
 /**
  * 本文件定义 App 的 API 配置。
- * 根据不同环境使用不同的 CSMS 地址。
+ * 支持多环境自动切换：开发/测试/生产
  * 
- * 生产环境：使用环境变量 CSMS_API_BASE（如果设置）
- * 开发环境：使用本地 IP 或 localhost
+ * 配置优先级：
+ * 1. 环境变量 EXPO_PUBLIC_CSMS_API_BASE（生产环境）
+ * 2. app.config.js 中的 csmsApiBase
+ * 3. 根据环境自动选择（开发/测试/生产）
  */
 
 import { Platform } from 'react-native';
+import Constants from 'expo-constants';
 
-// ===== 环境配置 =====
-// 优先使用环境变量（生产环境）
-// 在构建时可以通过 expo 的 app.config.js 或 eas.json 配置
-const PRODUCTION_API_BASE = process.env.EXPO_PUBLIC_CSMS_API_BASE || process.env.CSMS_API_BASE;
+// 从 app.config.js 的 extra 字段读取配置
+const config = Constants.expoConfig?.extra || {};
 
-// ===== 开发环境配置 =====
-// 您的电脑 IP 地址（用于真机连接开发环境）
-// 获取方法：macOS/Linux 运行 ifconfig，Windows 运行 ipconfig
-const COMPUTER_IP = '192.168.20.58'; // 修改为您的电脑 IP
+// 环境配置映射
+const ENV_CONFIGS = {
+  development: {
+    // 开发环境：使用本地 IP 或 localhost
+    getApiBase: (computerIp: string) => {
+      if (Platform.OS === 'android') {
+        // Android 模拟器特殊处理
+        // 可以通过环境变量 EXPO_PUBLIC_ANDROID_EMULATOR=true 强制使用 10.0.2.2
+        if (process.env.EXPO_PUBLIC_ANDROID_EMULATOR === 'true') {
+          return 'http://10.0.2.2:9000';
+        }
+        return `http://${computerIp}:9000`;
+      } else if (Platform.OS === 'ios') {
+        // iOS：使用电脑 IP（适用于真机和模拟器）
+        return `http://${computerIp}:9000`;
+      } else {
+        // Web 浏览器：使用 localhost
+        return 'http://localhost:9000';
+      }
+    },
+  },
+  staging: {
+    // 测试环境：使用测试服务器
+    getApiBase: () => process.env.EXPO_PUBLIC_STAGING_API_BASE || 
+                      config.stagingApiBase || 
+                      'https://staging-api.yourdomain.com',
+  },
+  production: {
+    // 生产环境：使用生产服务器
+    getApiBase: () => process.env.EXPO_PUBLIC_PROD_API_BASE || 
+                      config.prodApiBase || 
+                      'https://api.yourdomain.com',
+  },
+};
 
-// 根据运行平台选择 CSMS 地址
+/**
+ * 获取当前环境
+ * 优先级：环境变量 > app.config.js > 自动检测
+ */
+function getEnvironment(): 'development' | 'staging' | 'production' {
+  // 1. 从环境变量读取
+  if (process.env.EXPO_PUBLIC_ENV) {
+    const env = process.env.EXPO_PUBLIC_ENV.toLowerCase();
+    if (['development', 'staging', 'production'].includes(env)) {
+      return env as 'development' | 'staging' | 'production';
+    }
+  }
+  
+  // 2. 从 app.config.js 读取
+  if (config.environment) {
+    return config.environment as 'development' | 'staging' | 'production';
+  }
+  
+  // 3. 根据 API 地址自动判断
+  const apiBase = process.env.EXPO_PUBLIC_CSMS_API_BASE || config.csmsApiBase;
+  if (apiBase) {
+    if (apiBase.includes('localhost') || apiBase.includes('192.168') || apiBase.includes('10.0.2.2') || apiBase.includes('127.0.0.1')) {
+      return 'development';
+    }
+    if (apiBase.includes('staging') || apiBase.includes('test')) {
+      return 'staging';
+    }
+    return 'production';
+  }
+  
+  // 4. 默认开发环境
+  return 'development';
+}
+
+// 获取当前环境
+const environment = getEnvironment();
+
+// 获取环境配置
+const envConfig = ENV_CONFIGS[environment] || ENV_CONFIGS.development;
+
+// 确定 API 基础地址
 let CSMS_API_BASE: string;
 
-if (PRODUCTION_API_BASE) {
-  // 生产环境：使用环境变量配置的地址
-  CSMS_API_BASE = PRODUCTION_API_BASE;
+// 优先级 1: 直接指定的生产环境 API 地址
+if (process.env.EXPO_PUBLIC_CSMS_API_BASE || config.csmsApiBase) {
+  CSMS_API_BASE = process.env.EXPO_PUBLIC_CSMS_API_BASE || config.csmsApiBase!;
 } else {
-  // 开发环境：根据平台选择
-  if (Platform.OS === 'android') {
-    // Android：模拟器用 10.0.2.2，真机用电脑 IP
-    // 暂时统一用电脑 IP，避免真机连不上
-    CSMS_API_BASE = `http://${COMPUTER_IP}:9000`;
-  } else if (Platform.OS === 'ios') {
-    // iOS：使用电脑 IP（适用于真机和模拟器）
-    CSMS_API_BASE = `http://${COMPUTER_IP}:9000`;
+  // 优先级 2: 根据环境自动选择
+  if (environment === 'development') {
+    // 开发环境：使用自动检测的 IP 或配置的 IP
+    const computerIp = process.env.EXPO_PUBLIC_COMPUTER_IP || 
+                       config.computerIp || 
+                       '192.168.20.34';
+    CSMS_API_BASE = envConfig.getApiBase(computerIp);
   } else {
-    // Web 浏览器：使用 localhost
-    CSMS_API_BASE = 'http://localhost:9000';
+    // 测试/生产环境：使用环境配置
+    // staging 和 production 的 getApiBase 不需要参数
+    CSMS_API_BASE = (envConfig.getApiBase as () => string)();
   }
 }
 
@@ -48,9 +119,15 @@ export const API_ENDPOINTS = {
   remoteStop: `${CSMS_API_BASE}/api/remoteStop`,
   orders: `${CSMS_API_BASE}/api/orders`,
   currentOrder: `${CSMS_API_BASE}/api/orders/current`,
+  currentOrderMeter: `${CSMS_API_BASE}/api/orders/current/meter`,
   health: `${CSMS_API_BASE}/health`,
 };
 
 // 打印当前使用的 API 地址，方便调试（必须在 API_ENDPOINTS 定义之后）
-console.log(`[Config] Platform: ${Platform.OS}, API Base: ${CSMS_API_BASE}`);
+console.log(`[Config] ========================================`);
+console.log(`[Config] Environment: ${environment}`);
+console.log(`[Config] Platform: ${Platform.OS}`);
+console.log(`[Config] API Base: ${CSMS_API_BASE}`);
+console.log(`[Config] Computer IP: ${config.computerIp || 'N/A'}`);
 console.log(`[Config] Chargers endpoint: ${API_ENDPOINTS.chargers}`);
+console.log(`[Config] ========================================`);
